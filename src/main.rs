@@ -4,10 +4,17 @@ use axum::{
     routing::{get, post},
 };
 use chrono::{DateTime, Utc};
+use opentelemetry::global;
+use opentelemetry::trace::TracerProvider as _;
+use opentelemetry_otlp::SpanExporter;
+use opentelemetry_sdk::Resource;
+use opentelemetry_sdk::trace::SdkTracerProvider;
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgPool};
 use std::net::SocketAddr;
 use tracing::Instrument;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
 #[derive(Clone)]
 struct AppState {
@@ -29,12 +36,19 @@ struct CreateUser {
 #[tokio::main]
 
 async fn main() {
-    tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
-        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::FULL)
+    dotenvy::dotenv().ok();
+
+    let tracer_provider = init_tracer();
+    let tracer = tracer_provider.tracer("rust-telemetry");
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_target(true)
+                .with_span_events(tracing_subscriber::fmt::format::FmtSpan::FULL),
+        )
+        .with(tracing_opentelemetry::layer().with_tracer(tracer))
         .init();
     tracing::info!("tracing system initialized");
-    dotenvy::dotenv().ok();
     let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
     let db = PgPool::connect(&database_url)
         .await
@@ -52,6 +66,8 @@ async fn main() {
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
+
+    tracer_provider.shutdown().ok();
 }
 
 #[tracing::instrument]
@@ -127,4 +143,23 @@ async fn create_user(
     .map_err(|error| error.to_string())?;
 
     Ok(Json(user))
+}
+
+fn init_tracer() -> SdkTracerProvider {
+    use opentelemetry_otlp::WithExportConfig;
+
+    let exporter = SpanExporter::builder()
+        .with_tonic()
+        .with_endpoint("http://127.0.0.1:4317")
+        .build()
+        .expect("Failed to create OTLP exporter");
+
+    let resource = Resource::builder()
+        .with_service_name("rust-telemetry")
+        .build();
+
+    SdkTracerProvider::builder()
+        .with_resource(resource)
+        .with_batch_exporter(exporter)
+        .build()
 }
