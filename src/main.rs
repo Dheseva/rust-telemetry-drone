@@ -4,7 +4,7 @@ use axum::{
     routing::{get, post},
 };
 use chrono::{DateTime, Utc};
-use opentelemetry::global;
+// use opentelemetry::global;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::SpanExporter;
 use opentelemetry_sdk::Resource;
@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgPool};
 use std::net::SocketAddr;
 use tracing::Instrument;
+use tracing_subscriber::Layer;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
@@ -46,7 +47,15 @@ async fn main() {
                 .with_target(true)
                 .with_span_events(tracing_subscriber::fmt::format::FmtSpan::FULL),
         )
-        .with(tracing_opentelemetry::layer().with_tracer(tracer))
+        .with(
+            tracing_opentelemetry::layer()
+                .with_tracer(tracer)
+                .with_filter(
+                    tracing_subscriber::filter::Targets::new()
+                        .with_target("app", tracing::Level::TRACE)
+                        .with_target("rust_telemetry", tracing::Level::TRACE),
+                ),
+        )
         .init();
     tracing::info!("tracing system initialized");
     let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
@@ -70,17 +79,17 @@ async fn main() {
     tracer_provider.shutdown().ok();
 }
 
-#[tracing::instrument]
+#[tracing::instrument(target = "app")]
 async fn health() -> &'static str {
     tracing::info!("health check started");
 
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
 
     tracing::info!("health check finished");
     "OK"
 }
 
-#[tracing::instrument(skip(state))]
+#[tracing::instrument(target = "app", skip(state))]
 async fn get_users(State(state): State<AppState>) -> Result<Json<Vec<User>>, String> {
     let users = sqlx::query_as::<_, User>(
         r#"
@@ -96,7 +105,7 @@ async fn get_users(State(state): State<AppState>) -> Result<Json<Vec<User>>, Str
     Ok(Json(users))
 }
 
-#[tracing::instrument(skip(state))]
+#[tracing::instrument(target = "app", skip(state))]
 async fn get_user(
     State(state): State<AppState>,
     Path(id): Path<i64>,
@@ -118,7 +127,13 @@ async fn get_user(
     }
     .instrument(query_span)
     .await
-    .map_err(|error| error.to_string())?;
+    .map_err(|error| {
+        tracing::error!(
+        error = %error,
+        user_id = id,
+        "database query failed");
+        error.to_string()
+    })?;
 
     tracing::info!("user fetched successfully");
 
