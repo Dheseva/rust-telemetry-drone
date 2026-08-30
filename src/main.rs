@@ -4,7 +4,9 @@ use axum::{
     routing::{get, post},
 };
 use chrono::{DateTime, Utc};
+use tower_http::trace::TraceLayer;
 // use opentelemetry::global;
+use opentelemetry::trace::TraceContextExt;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::SpanExporter;
 use opentelemetry_sdk::Resource;
@@ -69,6 +71,15 @@ async fn main() {
         .route("/users", get(get_users))
         .route("/users", post(create_user))
         .route("/users/{id}", get(get_user))
+        .layer(
+            TraceLayer::new_for_http().make_span_with(|request: &axum::http::Request<_>| {
+                tracing::info_span!(
+                    "http_request",
+                    http.method = %request.method(),
+                    http.uri = %request.uri(),
+                )
+            }),
+        )
         .with_state(state);
 
     let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
@@ -129,9 +140,14 @@ async fn get_user(
     .instrument(query_span)
     .await
     .map_err(|error| {
+        let context = tracing::Span::current().context();
+        let span = context.span();
+        let span_context = span.span_context();
         tracing::error!(
         error = %error,
         user_id = id,
+        trace_id = %span_context.trace_id(),
+        span_id = %span_context.span_id(),
         "database query failed");
         tracing::Span::current().set_status(opentelemetry::trace::Status::error(error.to_string()));
         error.to_string()
