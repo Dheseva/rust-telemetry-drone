@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgPool};
 use std::net::SocketAddr;
 use tracing::Instrument;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 use tracing_subscriber::Layer;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -132,6 +133,7 @@ async fn get_user(
         error = %error,
         user_id = id,
         "database query failed");
+        tracing::Span::current().set_status(opentelemetry::trace::Status::error(error.to_string()));
         error.to_string()
     })?;
 
