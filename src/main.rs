@@ -1,6 +1,8 @@
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{MatchedPath, Path, State},
+    http::StatusCode,
+    response::IntoResponse,
     routing::{get, post},
 };
 use chrono::{DateTime, Utc};
@@ -15,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgPool};
 use std::net::SocketAddr;
 use tracing::Instrument;
+use tracing::field::Empty;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use tracing_subscriber::Layer;
 use tracing_subscriber::layer::SubscriberExt;
@@ -37,6 +40,25 @@ struct CreateUser {
     name: String,
     email: String,
 }
+
+#[derive(Debug)]
+enum AppError {
+    NotFound,
+    Database(sqlx::Error),
+}
+
+impl IntoResponse for AppError {
+    fn into_response(self) -> axum::response::Response {
+        match self {
+            AppError::NotFound => (StatusCode::NOT_FOUND, "User not found").into_response(),
+            AppError::Database(error) => {
+                tracing::error!(error = %error, "Database error");
+                (StatusCode::INTERNAL_SERVER_ERROR, "Database error").into_response()
+            }
+        }
+    }
+}
+
 #[tokio::main]
 
 async fn main() {
@@ -72,13 +94,33 @@ async fn main() {
         .route("/users", post(create_user))
         .route("/users/{id}", get(get_user))
         .layer(
-            TraceLayer::new_for_http().make_span_with(|request: &axum::http::Request<_>| {
-                tracing::info_span!(
-                    "http_request",
-                    http.method = %request.method(),
-                    http.uri = %request.uri(),
-                )
-            }),
+            TraceLayer::new_for_http()
+                .make_span_with(|request: &axum::http::Request<_>| {
+                    let route = request
+                        .extensions()
+                        .get::<MatchedPath>()
+                        .map(|path| path.as_str())
+                        .unwrap_or("<unknown>");
+
+                    tracing::info_span!(
+                        "http_request",
+                        http.method = %request.method(),
+                        http.route = %route,
+                        http.status_code = Empty,
+
+                    )
+                })
+                .on_response(
+                    |response: &axum::response::Response, _latency, span: &tracing::Span| {
+                        span.record("http.status_code", response.status().as_u16());
+
+                        tracing::info!(
+                            parent: span,
+                            status = %response.status(),
+                            "HTTP request completed"
+                        );
+                    },
+                ),
         )
         .with_state(state);
 
@@ -121,7 +163,7 @@ async fn get_users(State(state): State<AppState>) -> Result<Json<Vec<User>>, Str
 async fn get_user(
     State(state): State<AppState>,
     Path(id): Path<i64>,
-) -> Result<Json<User>, String> {
+) -> Result<Json<User>, AppError> {
     let query_span = tracing::info_span!("database_query", db.system = "postgresql", user_id = id);
     let user = async {
         tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
@@ -150,11 +192,13 @@ async fn get_user(
         span_id = %span_context.span_id(),
         "database query failed");
         tracing::Span::current().set_status(opentelemetry::trace::Status::error(error.to_string()));
-        error.to_string()
+        if matches!(error, sqlx::Error::RowNotFound) {
+            AppError::NotFound
+        } else {
+            AppError::Database(error)
+        }
     })?;
-
-    tracing::info!("user fetched successfully");
-
+    //tracing::info!("user fetched successfully");
     Ok(Json(user))
 }
 
