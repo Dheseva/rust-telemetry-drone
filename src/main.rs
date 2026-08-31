@@ -6,16 +6,17 @@ use axum::{
     routing::{get, post},
 };
 use chrono::{DateTime, Utc};
-use tower_http::trace::TraceLayer;
-// use opentelemetry::global;
+use opentelemetry::global;
 use opentelemetry::trace::TraceContextExt;
-use opentelemetry::trace::TracerProvider as _;
+//use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::SpanExporter;
 use opentelemetry_sdk::Resource;
+use opentelemetry_sdk::metrics::SdkMeterProvider;
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgPool};
 use std::net::SocketAddr;
+use tower_http::trace::TraceLayer;
 use tracing::Instrument;
 use tracing::field::Empty;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
@@ -26,6 +27,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 #[derive(Clone)]
 struct AppState {
     db: PgPool,
+    request_counter: opentelemetry::metrics::Counter<u64>,
 }
 #[derive(Debug, Serialize, FromRow)]
 struct User {
@@ -65,7 +67,15 @@ async fn main() {
     dotenvy::dotenv().ok();
 
     let tracer_provider = init_tracer();
-    let tracer = tracer_provider.tracer("rust-telemetry");
+    global::set_tracer_provider(tracer_provider.clone());
+    let meter_provider = init_meter_provider();
+    global::set_meter_provider(meter_provider.clone());
+    let tracer = global::tracer("rust-telemetry");
+    let meter = global::meter("rust-telemetry");
+    let request_counter = meter
+        .u64_counter("http_requests_total")
+        .with_description("Total number of HTTP requests")
+        .build();
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::fmt::layer()
@@ -87,7 +97,10 @@ async fn main() {
     let db = PgPool::connect(&database_url)
         .await
         .expect("Failed to connect to database");
-    let state = AppState { db };
+    let state = AppState {
+        db,
+        request_counter,
+    };
     let app = Router::new()
         .route("/health", get(health))
         .route("/users", get(get_users))
@@ -131,6 +144,7 @@ async fn main() {
     axum::serve(listener, app).await.unwrap();
 
     tracer_provider.shutdown().ok();
+    meter_provider.shutdown().ok();
 }
 
 #[tracing::instrument(target = "app")]
@@ -164,6 +178,13 @@ async fn get_user(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Result<Json<User>, AppError> {
+    state.request_counter.add(
+        1,
+        &[
+            opentelemetry::KeyValue::new("http.method", "GET"),
+            opentelemetry::KeyValue::new("http.route", "/users/{id}"),
+        ],
+    );
     let query_span = tracing::info_span!("database_query", db.system = "postgresql", user_id = id);
     let user = async {
         tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
@@ -238,5 +259,21 @@ fn init_tracer() -> SdkTracerProvider {
     SdkTracerProvider::builder()
         .with_resource(resource)
         .with_batch_exporter(exporter)
+        .build()
+}
+
+fn init_meter_provider() -> SdkMeterProvider {
+    let exporter = opentelemetry_otlp::MetricExporter::builder()
+        .with_tonic()
+        .build()
+        .expect("Failed to create metric exporter");
+
+    let resource = Resource::builder()
+        .with_service_name("rust-telemetry")
+        .build();
+
+    SdkMeterProvider::builder()
+        .with_resource(resource)
+        .with_periodic_exporter(exporter)
         .build()
 }
