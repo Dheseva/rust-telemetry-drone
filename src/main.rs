@@ -1,14 +1,16 @@
 use axum::{
     Json, Router,
-    extract::{MatchedPath, Path, State},
+    extract::{MatchedPath, Path, Request, State},
     http::StatusCode,
-    response::IntoResponse,
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
 use chrono::{DateTime, Utc};
 use opentelemetry::global;
 use opentelemetry::trace::TraceContextExt;
 //use opentelemetry::trace::TracerProvider as _;
+use opentelemetry::KeyValue;
 use opentelemetry_otlp::SpanExporter;
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::metrics::SdkMeterProvider;
@@ -16,6 +18,7 @@ use opentelemetry_sdk::trace::SdkTracerProvider;
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgPool};
 use std::net::SocketAddr;
+use std::time::Instant;
 use tower_http::trace::TraceLayer;
 use tracing::Instrument;
 use tracing::field::Empty;
@@ -28,6 +31,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 struct AppState {
     db: PgPool,
     request_counter: opentelemetry::metrics::Counter<u64>,
+    request_duration: opentelemetry::metrics::Histogram<f64>,
 }
 #[derive(Debug, Serialize, FromRow)]
 struct User {
@@ -76,6 +80,10 @@ async fn main() {
         .u64_counter("http_requests_total")
         .with_description("Total number of HTTP requests")
         .build();
+    let request_duration = meter
+        .f64_histogram("http_request_duration_seconds")
+        .with_description("HTTP request duration in seconds")
+        .build();
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::fmt::layer()
@@ -100,6 +108,7 @@ async fn main() {
     let state = AppState {
         db,
         request_counter,
+        request_duration,
     };
     let app = Router::new()
         .route("/health", get(health))
@@ -135,7 +144,8 @@ async fn main() {
                     },
                 ),
         )
-        .with_state(state);
+        .with_state(state.clone())
+        .layer(middleware::from_fn_with_state(state, metrics_middleware));
 
     let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
     println!("Server running on http://{}", addr);
@@ -145,6 +155,51 @@ async fn main() {
 
     tracer_provider.shutdown().ok();
     meter_provider.shutdown().ok();
+}
+
+async fn metrics_middleware(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    // Start measuring the request
+    let start = Instant::now();
+    // Get HTTP method
+    let method = request.method().clone();
+
+    // Get the matched route pattern
+    //
+    // Example:
+    // /users/123
+    // becomes:
+    // /users/{id}
+    let route = request
+        .extensions()
+        .get::<MatchedPath>()
+        .map(|path| path.as_str().to_owned())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    // Run the actual handler
+    let response = next.run(request).await;
+    // Calculate request duration
+    let duration = start.elapsed();
+    // Get HTTP status code
+    let status = response.status().as_u16();
+
+    let attributes = [
+        KeyValue::new("http.request.method", method.as_str().to_owned()),
+        KeyValue::new("http.route", route),
+        KeyValue::new("http.response.status_code", status.to_string()),
+    ];
+    // Request count
+    state.request_counter.add(1, &attributes);
+
+    // Request duration
+    state
+        .request_duration
+        .record(duration.as_secs_f64(), &attributes);
+
+    response
 }
 
 #[tracing::instrument(target = "app")]
@@ -178,13 +233,6 @@ async fn get_user(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Result<Json<User>, AppError> {
-    state.request_counter.add(
-        1,
-        &[
-            opentelemetry::KeyValue::new("http.method", "GET"),
-            opentelemetry::KeyValue::new("http.route", "/users/{id}"),
-        ],
-    );
     let query_span = tracing::info_span!("database_query", db.system = "postgresql", user_id = id);
     let user = async {
         tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
