@@ -32,6 +32,7 @@ struct AppState {
     db: PgPool,
     request_counter: opentelemetry::metrics::Counter<u64>,
     request_duration: opentelemetry::metrics::Histogram<f64>,
+    error_counter: opentelemetry::metrics::Counter<u64>,
 }
 #[derive(Debug, Serialize, FromRow)]
 struct User {
@@ -84,6 +85,11 @@ async fn main() {
         .f64_histogram("http_request_duration_seconds")
         .with_description("HTTP request duration in seconds")
         .build();
+    let error_counter = meter
+        .u64_counter("http_request_errors_total")
+        .with_description("Total number of HTTP request returning an errors")
+        .build();
+
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::fmt::layer()
@@ -109,6 +115,7 @@ async fn main() {
         db,
         request_counter,
         request_duration,
+        error_counter,
     };
     let app = Router::new()
         .route("/health", get(health))
@@ -198,6 +205,10 @@ async fn metrics_middleware(
     state
         .request_duration
         .record(duration.as_secs_f64(), &attributes);
+
+    if status >= 400 {
+        state.error_counter.add(1, &attributes);
+    }
 
     response
 }
